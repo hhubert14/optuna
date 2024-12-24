@@ -8,6 +8,7 @@ from typing import Any
 from typing import TYPE_CHECKING
 
 import numpy as np
+import threading
 
 from optuna._experimental import experimental_class
 from optuna.distributions import BaseDistribution
@@ -134,6 +135,10 @@ class BruteForceSampler(BaseSampler):
 
     def __init__(self, seed: int | None = None) -> None:
         self._rng = LazyRandomState(seed)
+        self._lock = threading.Lock()  # Add a lock for thread safety
+        self._current_trials = set()
+        self._total_trials = 0  # Track total trials
+        self._expected_trials = None
 
     def infer_relative_search_space(
         self, study: Study, trial: FrozenTrial
@@ -184,26 +189,30 @@ class BruteForceSampler(BaseSampler):
         param_name: str,
         param_distribution: BaseDistribution,
     ) -> Any:
-        trials = study.get_trials(
-            deepcopy=False,
-            states=(
-                TrialState.COMPLETE,
-                TrialState.PRUNED,
-                TrialState.RUNNING,
-                TrialState.FAIL,
-            ),
-        )
-        tree = _TreeNode()
-        candidates = _enumerate_candidates(param_distribution)
-        tree.expand(param_name, candidates)
-        # Populating must happen after the initialization above to prevent `tree` from
-        # being initialized as an empty graph, which is created with n_jobs > 1
-        # where we get trials[i].params = {} for some i.
-        self._populate_tree(tree, (t for t in trials if t.number != trial.number), trial.params)
-        if tree.count_unexpanded() == 0:
-            return param_distribution.to_external_repr(self._rng.rng.choice(candidates))
-        else:
-            return param_distribution.to_external_repr(tree.sample_child(self._rng.rng))
+        with self._lock:  # Ensure thread-safe access
+            self._current_trials.add(trial.number)
+            # time.sleep(2)
+            if self._expected_trials is None:
+                # Calculate total possible combinations on first sample
+                self._expected_trials = len(_enumerate_candidates(param_distribution)) ** 2
+
+            trials = study.get_trials(
+                deepcopy=False,
+                states=(
+                    TrialState.COMPLETE,
+                    TrialState.PRUNED,
+                    # TrialState.RUNNING,
+                    TrialState.FAIL,
+                ),
+            )
+            tree = _TreeNode()
+            candidates = _enumerate_candidates(param_distribution)
+            tree.expand(param_name, candidates)
+            self._populate_tree(tree, (t for t in trials if t.number != trial.number), trial.params)
+            if tree.count_unexpanded() == 0:
+                return param_distribution.to_external_repr(self._rng.rng.choice(candidates))
+            else:
+                return param_distribution.to_external_repr(tree.sample_child(self._rng.rng))
 
     def after_trial(
         self,
@@ -212,36 +221,45 @@ class BruteForceSampler(BaseSampler):
         state: TrialState,
         values: Sequence[float] | None,
     ) -> None:
-        trials = study.get_trials(
-            deepcopy=False,
-            states=(
-                TrialState.COMPLETE,
-                TrialState.PRUNED,
-                TrialState.RUNNING,
-                TrialState.FAIL,
-            ),
-        )
-        tree = _TreeNode()
-        self._populate_tree(
-            tree,
-            (
-                (
-                    t
-                    if t.number != trial.number
-                    else create_trial(
-                        state=state,  # Set current trial as complete.
-                        values=values,
+        with self._lock:  # Ensure thread-safe access
+            if trial.number not in self._current_trials:
+                return
+            
+            self._current_trials.remove(trial.number)
+            self._total_trials += 1
+
+            if self._total_trials >= self._expected_trials:
+                study.stop()
+                return
+
+            trials = study.get_trials(
+                deepcopy=False,
+                states=(
+                    TrialState.COMPLETE,
+                    TrialState.PRUNED,
+                    # TrialState.RUNNING,
+                    TrialState.FAIL,
+                ),
+            )
+            tree = _TreeNode()
+
+            # Create a list of trials including the current one with its final state
+            trial_list = []
+            for t in trials:
+                if t.number == trial.number:
+                    trial_list.append(create_trial(
+                        state=state,
+                        values=values, 
                         params=trial.params,
                         distributions=trial.distributions,
-                    )
-                )
-                for t in trials
-            ),
-            {},
-        )
+                    ))
+                else:
+                    trial_list.append(t)
 
-        if tree.count_unexpanded() == 0:
-            study.stop()
+            self._populate_tree(tree, trial_list, {})
+
+            if tree.count_unexpanded() == 0:
+                study.stop()
 
 
 def _enumerate_candidates(param_distribution: BaseDistribution) -> Sequence[float]:
